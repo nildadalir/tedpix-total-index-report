@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+import zipfile
 from datetime import date, datetime
+from io import BytesIO
 from pathlib import Path
 
 import jdatetime
@@ -14,9 +16,6 @@ from openpyxl import Workbook
 from openpyxl.chart import LineChart, Reference
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.marker import Marker
-from openpyxl.chart.shapes import GraphicalProperties
-from openpyxl.chart.series import SeriesLabel
-from openpyxl.drawing.line import LineProperties
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -334,20 +333,92 @@ def write_table(ws, start_row: int, frame: pd.DataFrame, date_cols, number_cols,
     return start_row + len(frame)
 
 
-def line_series_style(series, color: str, width=25000, marker=None, show_labels=False) -> None:
-    series.graphicalProperties = GraphicalProperties(ln=LineProperties(solidFill=color, w=width))
+def style_line_series(series, color: str) -> None:
+    # Keep DrawingML valid: one fill, positive width, no marker spPr soup.
     series.graphicalProperties.line.solidFill = color
-    if marker:
-        series.marker = marker
-        series.marker.graphicalProperties.solidFill = color
-        series.marker.graphicalProperties.line.solidFill = color
-    if show_labels:
-        series.dLbls = DataLabelList()
-        series.dLbls.showVal = True
-        series.dLbls.showCatName = False
-        series.dLbls.showSerName = False
-        series.dLbls.numFmt = "#,##0"
-        series.dLbls.dLblPos = "t"
+    series.graphicalProperties.line.w = 25000
+    series.marker = Marker(symbol="none")
+
+
+def style_marker_series(series, color: str) -> None:
+    series.graphicalProperties.line.noFill = True
+    marker = Marker(symbol="diamond", size=10)
+    marker.graphicalProperties.solidFill = color
+    marker.graphicalProperties.line.solidFill = color
+    series.marker = marker
+    labels = DataLabelList()
+    labels.showVal = True
+    labels.showCatName = False
+    labels.showSerName = False
+    labels.numFmt = "#,##0"
+    series.dLbls = labels
+
+
+def configure_axes(chart: LineChart, x_title: str, y_title: str) -> None:
+    chart.x_axis.title = x_title
+    chart.y_axis.title = y_title
+    chart.x_axis.axPos = "b"
+    chart.y_axis.axPos = "l"
+    chart.y_axis.numFmt = "#,##0"
+    chart.legend.position = "b"
+    chart.style = 10
+    chart.height = 12
+    chart.width = 22
+
+
+def make_excel_safe_drawing(xml: bytes) -> bytes:
+    text = xml.decode("utf-8")
+    text = text.replace(
+        "<cNvGraphicFramePr />",
+        '<cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></cNvGraphicFramePr>',
+    )
+    text = text.replace(
+        "<cNvGraphicFramePr/>",
+        '<cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></cNvGraphicFramePr>',
+    )
+    text = text.replace(
+        "<xfrm />",
+        '<xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xfrm>',
+    )
+    text = text.replace(
+        "<xfrm/>",
+        '<xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xfrm>',
+    )
+    text = text.replace('cNvPr id="1"', 'cNvPr id="2"')
+    text = text.replace('cNvPr id="2" name="Chart 2"', 'cNvPr id="3" name="Chart 2"')
+    return text.encode("utf-8")
+
+
+def sanitize_chart_xml(xml: bytes) -> bytes:
+    text = xml.decode("utf-8")
+    text = text.replace('<a:ln w="0">', "<a:ln>")
+    text = text.replace("<a:ln w=\"0\"/>", "<a:ln><a:noFill/></a:ln>")
+    # Excel rejects a line that is both filled and not filled.
+    text = text.replace(
+        "<a:noFill /><a:solidFill><a:srgbClr val=\"548235\" /></a:solidFill>",
+        "<a:noFill/>",
+    )
+    text = text.replace(
+        "<a:noFill /><a:solidFill><a:srgbClr val=\"C00000\" /></a:solidFill>",
+        "<a:noFill/>",
+    )
+    text = text.replace("<a:noFill />", "<a:noFill/>")
+    text = text.replace('<a:noFill/><a:prstDash val="solid" />', "<a:noFill/>")
+    text = text.replace("<a:noFill/><a:prstDash val=\"solid\"/>", "<a:noFill/>")
+    return text.encode("utf-8")
+
+
+def rewrite_xlsx_parts(path: Path, mutators: dict) -> None:
+    buffer = BytesIO()
+    with zipfile.ZipFile(path, "r") as zin, zipfile.ZipFile(buffer, "w") as zout:
+        for info in zin.infolist():
+            data = zin.read(info.filename)
+            if info.filename in mutators:
+                data = mutators[info.filename](data)
+            copied = zipfile.ZipInfo(filename=info.filename, date_time=info.date_time)
+            copied.compress_type = zipfile.ZIP_DEFLATED
+            zout.writestr(copied, data)
+    path.write_bytes(buffer.getvalue())
 
 
 def build_workbook(
@@ -407,25 +478,13 @@ def build_workbook(
     data_ref = Reference(daily_ws, min_col=3, min_row=1, max_col=5, max_row=last_daily_row)
 
     trend = LineChart()
-    trend.title = f"{INDEX_NAME} — {years[0]} to {years[-1]}"
-    trend.y_axis.title = "Index close"
-    trend.x_axis.title = "Date"
-    trend.style = 10
-    trend.height = 12
-    trend.width = 24
-    trend.legend.position = "b"
-    trend.y_axis.numFmt = "#,##0"
+    trend.title = f"TEDPIX Total Index {years[0]}-{years[-1]}"
+    configure_axes(trend, "Date", "Index close")
     trend.add_data(data_ref, titles_from_data=True)
     trend.set_categories(cats)
-    line_series_style(trend.series[0], NAVY, width=18000)
-    first_marker = Marker(symbol="diamond", size=10)
-    last_marker = Marker(symbol="diamond", size=10)
-    line_series_style(trend.series[1], GREEN, width=0, marker=first_marker, show_labels=True)
-    line_series_style(trend.series[2], RED, width=0, marker=last_marker, show_labels=True)
-    trend.series[1].graphicalProperties.line.noFill = True
-    trend.series[2].graphicalProperties.line.noFill = True
-    trend.series[1].tx = SeriesLabel(v="First close of each year")
-    trend.series[2].tx = SeriesLabel(v="Last close of each year")
+    style_line_series(trend.series[0], NAVY)
+    style_marker_series(trend.series[1], GREEN)
+    style_marker_series(trend.series[2], RED)
 
     # --- Overlay sheet ---
     overlay_headers = ["Day of year"] + [str(y) for y in years]
@@ -444,13 +503,7 @@ def build_workbook(
 
     overlay_chart = LineChart()
     overlay_chart.title = "Each year's trend (aligned by day of year)"
-    overlay_chart.y_axis.title = "Index close"
-    overlay_chart.x_axis.title = "Day of year"
-    overlay_chart.style = 10
-    overlay_chart.height = 12
-    overlay_chart.width = 24
-    overlay_chart.legend.position = "b"
-    overlay_chart.y_axis.numFmt = "#,##0"
+    configure_axes(overlay_chart, "Day of year", "Index close")
     overlay_data = Reference(
         overlay_ws, min_col=2, min_row=1, max_col=1 + len(years), max_row=overlay_last
     )
@@ -459,7 +512,7 @@ def build_workbook(
     overlay_chart.set_categories(overlay_cats)
     palette = [NAVY, "2E86AB", GOLD, GREEN, RED]
     for series, color in zip(overlay_chart.series, palette):
-        line_series_style(series, color, width=18000)
+        style_line_series(series, color)
 
     # --- Charts landing sheet ---
     charts["A1"] = INDEX_NAME
@@ -576,6 +629,14 @@ def build_workbook(
     notes.sheet_view.showGridLines = False
 
     wb.save(OUTPUT_XLSX)
+    rewrite_xlsx_parts(
+        OUTPUT_XLSX,
+        {
+            "xl/drawings/drawing1.xml": make_excel_safe_drawing,
+            "xl/charts/chart1.xml": sanitize_chart_xml,
+            "xl/charts/chart2.xml": sanitize_chart_xml,
+        },
+    )
 
 
 def main() -> None:
